@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
 from datetime import datetime
@@ -10,77 +10,74 @@ CORS(app)
 TMDB_API_KEY = "29dfffa9ae088178fa088680b67ce583"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 
-TARGET_LANGUAGES = ["hi", "te", "ta", "ml", "kn"]
+SUPPORTED_LANGUAGES = {"hi", "ml", "ta", "te", "kn"}  # Hindi, Malayalam, Tamil, Telugu, Kannada
 all_movies_cache = []
 
-def fetch_trending_movies():
+def fetch_trending_indian_movies():
     global all_movies_cache
-    print("[CACHE] Fetching trending Indian movies...")
-
+    print("[CACHE] Fetching trending Indian movies available on OTT...")
     today = datetime.now().strftime("%Y-%m-%d")
-    collected = []
+    final_movies = []
 
-    for page in range(1, 25):  # Go deeper to get more results
-        print(f"[INFO] Checking page {page}")
-        params = {
-            "api_key": TMDB_API_KEY,
-            "sort_by": "popularity.desc",
-            "region": "IN",
-            "watch_region": "IN",
-            "page": page,
-            "release_date.lte": today
-        }
-
+    for page in range(1, 6):  # Fetch more pages for broader coverage
+        print(f"[INFO] Checking trending page {page}")
         try:
-            response = requests.get(f"{TMDB_BASE_URL}/discover/movie", params=params)
+            trending_url = f"{TMDB_BASE_URL}/trending/movie/day"
+            response = requests.get(trending_url, params={"api_key": TMDB_API_KEY, "page": page})
+            response.raise_for_status()
             results = response.json().get("results", [])
-            if not results:
-                break
+
             for movie in results:
                 lang = movie.get("original_language")
-                if lang not in TARGET_LANGUAGES:
+                if lang not in SUPPORTED_LANGUAGES:
                     continue
 
                 movie_id = movie.get("id")
-                if not movie_id or not movie.get("title") or not movie.get("poster_path"):
+                title = movie.get("title")
+                if not movie_id or not title:
                     continue
 
-                # Check OTT availability in India
-                prov_url = f"{TMDB_BASE_URL}/movie/{movie_id}/watch/providers"
-                prov_response = requests.get(prov_url, params={"api_key": TMDB_API_KEY})
+                providers_url = f"{TMDB_BASE_URL}/movie/{movie_id}/watch/providers"
+                prov_response = requests.get(providers_url, params={"api_key": TMDB_API_KEY})
                 prov_data = prov_response.json()
+
                 if "results" in prov_data and "IN" in prov_data["results"]:
                     if "flatrate" in prov_data["results"]["IN"]:
-                        movie["media_type"] = "movie"
-                        collected.append(movie)
+                        ext_url = f"{TMDB_BASE_URL}/movie/{movie_id}/external_ids"
+                        ext_response = requests.get(ext_url, params={"api_key": TMDB_API_KEY})
+                        ext_data = ext_response.json()
+                        imdb_id = ext_data.get("imdb_id")
 
-                if len(collected) >= 100:
-                    break
-            if len(collected) >= 100:
-                break
+                        if imdb_id and imdb_id.startswith("tt"):
+                            movie["imdb_id"] = imdb_id
+                            final_movies.append(movie)
 
         except Exception as e:
-            print(f"[ERROR] Page {page} failed: {e}")
-            break
+            print(f"[ERROR] Failed to fetch or parse page {page}: {e}")
+            continue
 
-    # Deduplicate and clean
     seen_ids = set()
-    unique = []
-    for movie in collected:
-        movie_id = movie.get("id")
-        if movie_id and movie_id not in seen_ids:
-            seen_ids.add(movie_id)
-            unique.append(movie)
+    unique_movies = []
+    for movie in final_movies:
+        imdb_id = movie.get("imdb_id")
+        if imdb_id and imdb_id not in seen_ids:
+            seen_ids.add(imdb_id)
+            unique_movies.append(movie)
 
-    all_movies_cache = unique
+    all_movies_cache = unique_movies[:100]  # Limit to 100 max
     print(f"[CACHE] Fetched {len(all_movies_cache)} trending Indian movies ✅")
 
 def to_stremio_meta(movie):
     try:
+        imdb_id = movie.get("imdb_id")
+        title = movie.get("title")
+        if not imdb_id or not title:
+            return None
+
         return {
-            "id": f"movie_{movie['id']}",
+            "id": imdb_id,
             "type": "movie",
-            "name": movie.get("title"),
+            "name": title,
             "poster": f"https://image.tmdb.org/t/p/w500{movie['poster_path']}" if movie.get("poster_path") else None,
             "description": movie.get("overview", ""),
             "releaseInfo": movie.get("release_date", ""),
@@ -96,26 +93,24 @@ def manifest():
         "id": "org.trending.indian.catalog",
         "version": "1.0.0",
         "name": "Trending Indian",
-        "description": "Top trending Indian Movies",
+        "description": "Trending Indian Movies on OTT",
         "resources": ["catalog"],
         "types": ["movie"],
         "catalogs": [{
             "type": "movie",
-            "id": "trending-indian",
+            "id": "trending_indian",
             "name": "Trending Indian"
         }],
-        "idPrefixes": []
+        "idPrefixes": ["tt"]
     })
 
-@app.route("/catalog/<type>/<catalog_id>.json")
-def catalog(type, catalog_id):
-    if catalog_id != "trending-indian":
-        return jsonify({"metas": []})
-
-    print(f"[INFO] Catalog requested: {type}")
+@app.route("/catalog/movie/trending_indian.json")
+def catalog():
+    print("[INFO] Catalog requested")
     try:
-        metas = [to_stremio_meta(m) for m in all_movies_cache]
-        return jsonify({"metas": [m for m in metas if m]})
+        metas = [meta for meta in (to_stremio_meta(m) for m in all_movies_cache) if meta]
+        print(f"[INFO] Returning {len(metas)} total movies ✅")
+        return jsonify({"metas": metas})
     except Exception as e:
         print(f"[ERROR] Catalog error: {e}")
         return jsonify({"metas": []})
@@ -124,7 +119,7 @@ def catalog(type, catalog_id):
 def refresh():
     def do_refresh():
         try:
-            fetch_trending_movies()
+            fetch_trending_indian_movies()
             print("[REFRESH] Background refresh complete ✅")
         except Exception as e:
             import traceback
@@ -133,8 +128,8 @@ def refresh():
     threading.Thread(target=do_refresh).start()
     return jsonify({"status": "refresh started in background"})
 
-# Initial fetch
-fetch_trending_movies()
+# Fetch on startup
+fetch_trending_indian_movies()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
